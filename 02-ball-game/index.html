@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>コロコロ・ライラック — 玉転がしコイン集め</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #1a1326; touch-action: none; }
+  canvas { display: block; }
+  #ui {
+    position: fixed; inset: 0; pointer-events: none;
+    font-family: -apple-system, "Helvetica Neue", "Hiragino Kaku Gothic ProN", sans-serif;
+    color: #fff;
+  }
+  .hud {
+    position: absolute; top: 14px; left: 16px; display: flex; gap: 18px; align-items: baseline;
+    text-shadow: 0 2px 8px rgba(0,0,0,.45);
+  }
+  .hud .coins { font-size: 1.5rem; font-weight: 800; }
+  .hud .timer { font-size: 1.1rem; opacity: .85; font-variant-numeric: tabular-nums; }
+  .hud .best  { font-size: .85rem; opacity: .6; }
+  #hint {
+    position: absolute; bottom: 9%; width: 100%; text-align: center;
+    font-size: .95rem; opacity: .8; transition: opacity .6s; text-shadow: 0 2px 8px rgba(0,0,0,.5);
+  }
+  #clear {
+    position: absolute; inset: 0; display: none; place-items: center;
+    background: rgba(26,19,38,.55); backdrop-filter: blur(4px); pointer-events: auto;
+  }
+  #clear .panel {
+    text-align: center; padding: 2.2rem 3rem; border-radius: 20px;
+    background: rgba(40,28,60,.85); border: 1px solid rgba(255,255,255,.15);
+    animation: pop .45s cubic-bezier(.2,1.6,.4,1);
+  }
+  @keyframes pop { from { transform: scale(.7); opacity: 0; } }
+  #clear h1 { font-size: 1.6rem; margin-bottom: .6rem; }
+  #clear .time { font-size: 2.4rem; font-weight: 800; color: #ffd76a; font-variant-numeric: tabular-nums; }
+  #clear .newbest { color: #7dffb1; font-weight: 700; height: 1.4em; }
+  #clear button {
+    margin-top: 1.1rem; padding: .7rem 2.2rem; font-size: 1.05rem; font-weight: 700;
+    color: #2a1c44; background: #c9a6ff; border: 0; border-radius: 999px; cursor: pointer;
+  }
+  #clear button:active { transform: scale(.96); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="ui">
+  <div class="hud">
+    <div class="coins"><span id="got">0</span>/<span id="total">12</span> 🪙</div>
+    <div class="timer" id="timer">0.00</div>
+    <div class="best" id="bestLabel"></div>
+  </div>
+  <div id="hint">WASD / 矢印キーで移動・スペースでジャンプ　（スマホ：左半分ドラッグで移動・右半分タップでジャンプ）</div>
+  <div id="clear">
+    <div class="panel">
+      <h1>ぜんぶ集めた！🎉</h1>
+      <div class="time" id="clearTime"></div>
+      <div class="newbest" id="newBest"></div>
+      <button id="retry">もう一度（R）</button>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three'
+
+/* ============================================================
+   コロコロ・ライラック — Obsidian『3Dゲーム制作』ノートの実装練習
+   ・タイトル画面なし＝ロード完了で即操作（03ノート: Poki 10秒ルール）
+   ・移動は全て dt 基準＝リフレッシュレート非依存（01ノート）
+   ・ローポリ＋フラットシェーディング＋限定パレット（02ノート）
+   ・1アクション3フィードバック: 視覚＋音＋動き（03ノート: ジュース）
+   ============================================================ */
+
+const REDUCE = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+// ---- パレット（限定5色＝統一感はパレットが作る / 02ノート） ----
+const COL = {
+  bg:     0x1a1326,
+  ground: 0x2e2244,
+  wall:   0x3d2d5c,
+  box:    0x55407e,
+  boxTop: 0x6e54a0,
+  ball:   0xc9a6ff,   // ライラック
+  coin:   0xffd76a,
+  accent: 0x7dffb1,
+}
+
+// ---- 基本セットアップ ----
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+renderer.setSize(innerWidth, innerHeight)
+renderer.shadowMap.enabled = true
+renderer.shadowMap.type = THREE.PCFSoftShadowMap
+document.getElementById('app').appendChild(renderer.domElement)
+
+const scene = new THREE.Scene()
+scene.background = new THREE.Color(COL.bg)
+scene.fog = new THREE.Fog(COL.bg, 26, 46)
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 100)
+
+scene.add(new THREE.HemisphereLight(0xbfa6e8, 0x241a38, 0.9))
+const sun = new THREE.DirectionalLight(0xffffff, 1.6)
+sun.position.set(8, 14, 6)
+sun.castShadow = true
+sun.shadow.mapSize.set(1024, 1024)
+const sc = 16
+sun.shadow.camera.left = -sc; sun.shadow.camera.right = sc
+sun.shadow.camera.top = sc;  sun.shadow.camera.bottom = -sc
+scene.add(sun)
+
+// ---- アリーナ ----
+const ARENA = 17           // 半径（壁の内側）
+const mat = (c, flat = true) => new THREE.MeshStandardMaterial({ color: c, flatShading: flat, roughness: .85 })
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(ARENA * 2 + 4, ARENA * 2 + 4), mat(COL.ground, false))
+ground.rotation.x = -Math.PI / 2
+ground.receiveShadow = true
+scene.add(ground)
+
+// 壁（外周4枚・高さ2＝飛び越え不可）
+const walls = []
+{
+  const t = 1, h = 2, L = ARENA * 2 + 4
+  const defs = [
+    { x: 0, z: -(ARENA + t / 2), w: L, d: t },
+    { x: 0, z:  (ARENA + t / 2), w: L, d: t },
+    { x: -(ARENA + t / 2), z: 0, w: t, d: L },
+    { x:  (ARENA + t / 2), z: 0, w: t, d: L },
+  ]
+  for (const d of defs) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(d.w, h, d.d), mat(COL.wall))
+    m.position.set(d.x, h / 2, d.z)
+    m.castShadow = m.receiveShadow = true
+    scene.add(m)
+    walls.push({ ...d, h })
+  }
+}
+
+// 障害物ボックス（乗れる・飛び越えられる）
+// 起承転結配置：①開けた場所→②低い箱→③中くらい→④一番高い箱の上にラストコイン（03ノート）
+const boxDefs = [
+  { x: -6, z: -4, w: 3, d: 3, h: 0.8 },
+  { x:  5, z: -6, w: 3, d: 3, h: 0.8 },
+  { x:  8, z:  4, w: 3, d: 3, h: 1.2 },
+  { x: -8, z:  7, w: 3, d: 3, h: 1.2 },
+  { x: -2, z: 10, w: 3, d: 3, h: 1.2 },
+  { x:  1, z:  2, w: 3.4, d: 3.4, h: 1.6 },   // ④ラストコイン台
+]
+const boxes = []
+for (const b of boxDefs) {
+  const g = new THREE.BoxGeometry(b.w, b.h, b.d)
+  const m = new THREE.Mesh(g, mat(b.h >= 1.6 ? COL.boxTop : COL.box))
+  m.position.set(b.x, b.h / 2, b.z)
+  m.castShadow = m.receiveShadow = true
+  scene.add(m)
+  boxes.push(b)
+}
+const solids = [...walls.map(w => ({ ...w, h: w.h })), ...boxes]
+
+// ---- ボール（外側グループ＝squash用 / 内側メッシュ＝回転用） ----
+const R = 0.5
+const ballOuter = new THREE.Group()
+const ballMesh = new THREE.Mesh(new THREE.IcosahedronGeometry(R, 1), mat(COL.ball))
+ballMesh.castShadow = true
+ballOuter.add(ballMesh)
+scene.add(ballOuter)
+
+// ---- コイン ----
+const coinGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.1, 14)
+const coinMat = new THREE.MeshStandardMaterial({ color: COL.coin, flatShading: true, roughness: .4, metalness: .35, emissive: 0x4a3500 })
+// ①〜④の順に難しくなる配置
+const coinDefs = [
+  { x: 0, z: -5 }, { x: -4, z: 0 }, { x: 4, z: 1 }, { x: 0, z: 6 },          // ①平地・開けた場所
+  { x: -11, z: -9 }, { x: 11, z: -10 }, { x: 12, z: 11 }, { x: -12, z: 12 },// ②四隅へ誘導
+  { x: -6, z: -4, top: 0 }, { x: 5, z: -6, top: 1 },                         // ③低い箱の上（ジャンプ練習）
+  { x: 8, z: 4, top: 2 },                                                    // ③中くらいの箱
+  { x: 1, z: 2, top: 5 },                                                    // ④一番高い箱＝集大成
+]
+const coins = coinDefs.map(c => {
+  const baseY = c.top !== undefined ? boxes[c.top].h : 0
+  const m = new THREE.Mesh(coinGeo, coinMat)
+  m.rotation.x = Math.PI / 2
+  m.castShadow = true
+  m.userData = { x: c.x, z: c.z, baseY: baseY + 0.55, got: false, t: Math.random() * 6 }
+  scene.add(m)
+  return m
+})
+document.getElementById('total').textContent = coins.length
+
+// ---- パーティクル（1つのPointsに統合＝ドローコール1 / 02ノート） ----
+const PMAX = 240
+const pGeo = new THREE.BufferGeometry()
+const pPos = new Float32Array(PMAX * 3)
+const pCol = new Float32Array(PMAX * 3)
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3))
+pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3))
+const points = new THREE.Points(pGeo, new THREE.PointsMaterial({
+  size: 0.16, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+}))
+points.frustumCulled = false
+scene.add(points)
+const particles = []   // {i, pos, vel, life, max, color}
+let pNext = 0
+function burst(origin, color, n, spread = 4, up = 3) {
+  if (REDUCE) n = Math.ceil(n / 2)
+  const c = new THREE.Color(color)
+  for (let k = 0; k < n; k++) {
+    const i = pNext = (pNext + 1) % PMAX
+    particles.push({
+      i,
+      pos: origin.clone(),
+      vel: new THREE.Vector3((Math.random() - .5) * spread, Math.random() * up, (Math.random() - .5) * spread),
+      life: 0, max: 0.5 + Math.random() * 0.4, color: c,
+    })
+  }
+}
+
+// ---- サウンド（WebAudio・外部アセットなし。初回入力でresume＝自動再生規制対応） ----
+let actx = null
+function audio() {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)()
+  if (actx.state === 'suspended') actx.resume()
+  return actx
+}
+function beep(freq, dur = 0.12, type = 'sine', vol = 0.18, slide = 0) {
+  try {
+    const ctx = audio(), t = ctx.currentTime
+    const o = ctx.createOscillator(), g = ctx.createGain()
+    o.type = type; o.frequency.setValueAtTime(freq, t)
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), t + dur)
+    g.gain.setValueAtTime(vol, t)
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur)
+    o.connect(g).connect(ctx.destination)
+    o.start(t); o.stop(t + dur)
+  } catch (e) { /* 音は失敗しても無視（シークレットモード等） */ }
+}
+const PENTA = [523, 587, 659, 784, 880, 1047, 1175, 1319, 1568, 1760, 2093, 2349] // コインごとに音階上昇
+
+// ---- 入力（イベントで直接動かさず、状態に溜めてループで読む / 01ノート） ----
+const keys = new Set()
+let jumpQueued = false
+addEventListener('keydown', e => {
+  if (e.repeat) return
+  keys.add(e.code)
+  if (e.code === 'Space') { jumpQueued = true; audio() }
+  if (e.code === 'KeyR') restart()
+  hideHint()
+})
+addEventListener('keyup', e => keys.delete(e.code))
+
+// タッチ：左半分=バーチャルスティック / 右半分タップ=ジャンプ
+const stick = { active: false, id: -1, ox: 0, oy: 0, dx: 0, dy: 0 }
+addEventListener('pointerdown', e => {
+  audio(); hideHint()
+  if (e.pointerType === 'mouse') return
+  if (e.clientX < innerWidth / 2) {
+    stick.active = true; stick.id = e.pointerId
+    stick.ox = e.clientX; stick.oy = e.clientY; stick.dx = stick.dy = 0
+  } else {
+    jumpQueued = true
+  }
+})
+addEventListener('pointermove', e => {
+  if (stick.active && e.pointerId === stick.id) {
+    stick.dx = (e.clientX - stick.ox) / 60
+    stick.dy = (e.clientY - stick.oy) / 60
+  }
+})
+addEventListener('pointerup', e => {
+  if (e.pointerId === stick.id) { stick.active = false; stick.dx = stick.dy = 0 }
+})
+
+let hintHidden = false
+function hideHint() {
+  if (hintHidden) return
+  hintHidden = true
+  document.getElementById('hint').style.opacity = 0
+}
+
+// ---- ゲーム状態（ステートマシン / 01ノート） ----
+let state = 'playing'        // 'playing' | 'clear'
+let started = false          // タイマーは初入力から
+let time = 0
+let gotCount = 0
+const pos = new THREE.Vector3(0, R, -10)
+const vel = new THREE.Vector3()
+let grounded = true
+let squash = 0               // -1(ストレッチ)〜1(スカッシュ)
+let camShake = 0
+
+// ベストタイム（localStorageはtry/catch＝シークレットモード対応 / 03ノートPoki基準）
+function loadBest() { try { return Number(localStorage.getItem('koro-best')) || 0 } catch { return 0 } }
+function saveBest(v) { try { localStorage.setItem('koro-best', String(v)) } catch {} }
+let best = loadBest()
+const bestLabel = document.getElementById('bestLabel')
+if (best) bestLabel.textContent = `ベスト ${best.toFixed(2)}`
+
+// ---- 物理（自前アーケード物理：高さマップ方式） ----
+const GRAV = -32, ACCEL = 30, JUMP_V = 11.5
+function groundHeightAt(x, z) {
+  let h = 0
+  for (const b of boxes) {
+    if (Math.abs(x - b.x) <= b.w / 2 && Math.abs(z - b.z) <= b.d / 2) h = Math.max(h, b.h)
+  }
+  return h
+}
+function collideXZ() {
+  for (const s of solids) {
+    const top = s.h
+    if (pos.y - R >= top - 0.02) continue      // 上にいるなら横方向は当たらない（飛び越え/着地）
+    const minX = s.x - s.w / 2, maxX = s.x + s.w / 2
+    const minZ = s.z - s.d / 2, maxZ = s.z + s.d / 2
+    const cx = Math.max(minX, Math.min(pos.x, maxX))
+    const cz = Math.max(minZ, Math.min(pos.z, maxZ))
+    let dx = pos.x - cx, dz = pos.z - cz
+    let len = Math.hypot(dx, dz)
+    if (len >= R) continue
+    if (len < 1e-5) {
+      // 中心が箱内：浅い軸に押し出す
+      const px = Math.min(pos.x - minX, maxX - pos.x)
+      const pz = Math.min(pos.z - minZ, maxZ - pos.z)
+      if (px < pz) { dx = (pos.x < s.x ? -1 : 1); dz = 0; len = 0 }
+      else { dz = (pos.z < s.z ? -1 : 1); dx = 0; len = 0 }
+      pos.x += dx * (R + 0.001); pos.z += dz * (R + 0.001)
+    } else {
+      const nx = dx / len, nz = dz / len
+      pos.x = cx + nx * (R + 0.001)
+      pos.z = cz + nz * (R + 0.001)
+      const dot = vel.x * nx + vel.z * nz
+      if (dot < 0) { vel.x -= dot * nx; vel.z -= dot * nz }  // 壁ずり
+    }
+  }
+}
+
+// ---- リスタート ----
+function restart() {
+  for (const c of coins) { c.userData.got = false; c.visible = true }
+  gotCount = 0; time = 0; started = false; state = 'playing'
+  pos.set(0, R, -10); vel.set(0, 0, 0)
+  document.getElementById('got').textContent = 0
+  document.getElementById('timer').textContent = '0.00'
+  document.getElementById('clear').style.display = 'none'
+}
+document.getElementById('retry').addEventListener('click', restart)
+
+// ---- クリア ----
+function onClear() {
+  state = 'clear'
+  beep(523, .12, 'triangle', .2);
+  setTimeout(() => beep(659, .12, 'triangle', .2), 110)
+  setTimeout(() => beep(784, .12, 'triangle', .2), 220)
+  setTimeout(() => beep(1047, .3, 'triangle', .22), 330)
+  burst(pos.clone().add(new THREE.Vector3(0, 1, 0)), COL.accent, 60, 8, 7)
+  burst(pos.clone().add(new THREE.Vector3(0, 1, 0)), COL.coin, 60, 8, 7)
+  const isBest = !best || time < best
+  if (isBest) { best = time; saveBest(best) }
+  document.getElementById('clearTime').textContent = time.toFixed(2) + ' 秒'
+  document.getElementById('newBest').textContent = isBest ? '🏆 ベスト更新！' : `ベスト ${best.toFixed(2)} 秒`
+  bestLabel.textContent = `ベスト ${best.toFixed(2)}`
+  document.getElementById('clear').style.display = 'grid'
+}
+
+// ---- メインループ ----
+const clock = new THREE.Clock()
+const camPos = new THREE.Vector3(0, 8, -19)
+const camTarget = new THREE.Vector3()
+const rotAxis = new THREE.Vector3()
+const ROT_Q = new THREE.Quaternion()
+
+renderer.setAnimationLoop(() => {
+  let dt = Math.min(clock.getDelta(), 1 / 30)   // タブ復帰の暴走防止クランプ
+
+  // --- 入力ベクトル ---
+  let ix = 0, iz = 0
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    iz += 1
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  iz -= 1
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  ix += 1
+  if (keys.has('KeyD') || keys.has('ArrowRight')) ix -= 1
+  if (stick.active) {
+    ix -= Math.max(-1, Math.min(1, stick.dx))
+    iz -= Math.max(-1, Math.min(1, stick.dy))
+  }
+  const ilen = Math.hypot(ix, iz)
+  if (ilen > 1) { ix /= ilen; iz /= ilen }
+  if (!started && (ilen > 0.01 || jumpQueued) && state === 'playing') started = true
+
+  if (state === 'playing') {
+    // --- 物理（全部dt基準 / 144Hzでも同じ挙動） ---
+    vel.x += ix * ACCEL * dt
+    vel.z += iz * ACCEL * dt
+    const damp = Math.exp(-(grounded ? 4.2 : 0.7) * dt)   // 接地中は摩擦・空中は弱く
+    vel.x *= damp; vel.z *= damp
+    vel.y += GRAV * dt
+
+    if (jumpQueued) {
+      if (grounded) {
+        vel.y = JUMP_V
+        grounded = false
+        squash = -1                                       // ストレッチ
+        beep(300, .15, 'square', .07, 250)
+        burst(pos.clone().setY(pos.y - R + 0.05), COL.ball, 8, 3, 1.5)
+      }
+      jumpQueued = false
+    }
+
+    pos.addScaledVector(vel, dt)
+    collideXZ()
+
+    // 着地（高さマップ）
+    const gh = groundHeightAt(pos.x, pos.z)
+    if (pos.y - R <= gh + 0.001) {
+      if (!grounded && vel.y < -4) {                      // 強い着地＝ジュース
+        squash = 1
+        camShake = REDUCE ? 0 : Math.min(0.25, -vel.y * 0.018)
+        beep(95, .1, 'sine', .12)
+        burst(pos.clone().setY(gh + 0.05), 0x8a76b8, 10, 3.5, 1.2)
+      }
+      pos.y = gh + R
+      vel.y = 0
+      grounded = true
+    } else if (pos.y - R > gh + 0.05) {
+      grounded = false
+    }
+
+    // --- コイン ---
+    for (const c of coins) {
+      const u = c.userData
+      if (u.got) continue
+      u.t += dt
+      c.position.set(u.x, u.baseY + Math.sin(u.t * 2.4) * 0.09, u.z)
+      c.rotation.z = u.t * 1.8
+      const dx = pos.x - u.x, dz = pos.z - u.z, dy = pos.y - c.position.y
+      if (dx * dx + dz * dz + dy * dy < (R + 0.42) ** 2) {
+        u.got = true; c.visible = false
+        gotCount++
+        document.getElementById('got').textContent = gotCount
+        beep(PENTA[Math.min(gotCount - 1, PENTA.length - 1)], .14, 'triangle', .16)  // 取るほど音階が上がる
+        burst(c.position, COL.coin, 16, 4, 3)
+        if (gotCount === coins.length) onClear()
+      }
+    }
+
+    if (started) {
+      time += dt
+      document.getElementById('timer').textContent = time.toFixed(2)
+    }
+  }
+
+  // --- ボールの見た目（回転＝速度から、squash＝着地/ジャンプ） ---
+  const speed = Math.hypot(vel.x, vel.z)
+  if (speed > 0.01) {
+    rotAxis.set(vel.z, 0, -vel.x).normalize()             // 上×速度＝回転軸
+    ROT_Q.setFromAxisAngle(rotAxis, (speed * dt) / R)
+    ballMesh.quaternion.premultiply(ROT_Q)
+  }
+  squash += (0 - squash) * Math.min(1, dt * 10)
+  const sy = 1 - squash * 0.32, sxz = 1 + squash * 0.22
+  ballOuter.scale.set(sxz, sy, sxz)
+  ballOuter.position.copy(pos)
+  if (squash > 0.05) ballOuter.position.y = pos.y - R * (1 - sy)  // 潰れた分沈める
+
+  // --- パーティクル更新 ---
+  pPos.fill(0)
+  for (let k = particles.length - 1; k >= 0; k--) {
+    const p = particles[k]
+    p.life += dt
+    if (p.life >= p.max) { particles.splice(k, 1); continue }
+    p.vel.y -= 14 * dt
+    p.pos.addScaledVector(p.vel, dt)
+    const f = 1 - p.life / p.max
+    pPos[p.i * 3] = p.pos.x; pPos[p.i * 3 + 1] = p.pos.y; pPos[p.i * 3 + 2] = p.pos.z
+    pCol[p.i * 3] = p.color.r * f; pCol[p.i * 3 + 1] = p.color.g * f; pCol[p.i * 3 + 2] = p.color.b * f
+  }
+  pGeo.attributes.position.needsUpdate = true
+  pGeo.attributes.color.needsUpdate = true
+
+  // --- カメラ（lerp追従＋速度の先読み / GSAPのイージング感覚） ---
+  camTarget.set(pos.x + vel.x * 0.25, pos.y, pos.z + vel.z * 0.25)
+  camPos.lerp(new THREE.Vector3(pos.x, pos.y + 8.5, pos.z - 11.5), Math.min(1, dt * 3.2))
+  camShake = Math.max(0, camShake - dt * 1.4)
+  camera.position.set(
+    camPos.x + (Math.random() - .5) * camShake,
+    camPos.y + (Math.random() - .5) * camShake,
+    camPos.z,
+  )
+  camera.lookAt(camTarget)
+
+  renderer.render(scene, camera)
+})
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight
+  camera.updateProjectionMatrix()
+  renderer.setSize(innerWidth, innerHeight)
+})
+</script>
+</body>
+</html>
